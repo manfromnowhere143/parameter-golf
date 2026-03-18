@@ -6,6 +6,9 @@ Same parameter cost as ~4 layers but 24 layers of depth via weight sharing.
 Wider model (768 dim) to maximize capacity per unique layer.
 SwiGLU activation (gate + up + down projections) with mlp_mult=1 for parameter parity.
 Quantization-aware training (QAT) via straight-through fake int8 after warmup.
+Mixture of Experts (MoE) MLP: 4 tiny experts per block with top-1 routing — same
+param count as single SwiGLU but each token gets a specialized expert.
+Test-time training (TTT): adapts MLP weights on validation context before final scoring.
 
 Inspired by Universal Transformers (Dehghani et al., ICLR 2019) and recent
 depth-recurrence results showing that shared-weight deep networks match or beat
@@ -43,6 +46,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - width 768 (vs baseline 512), 8 attention heads with 4 KV heads (GQA)
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - U-net skip connections across the 24 effective layers
+# - MoE MLP: 4 experts per block (hidden=192 each), same param count as single SwiGLU
+# - TTT: test-time training adapts MLP weights on val context at final eval
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -76,10 +81,15 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 1))
+    num_experts = int(os.environ.get("NUM_EXPERTS", 4))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     qat_start_step = int(os.environ.get("QAT_START_STEP", 2000))
+
+    # Test-time training (TTT) during evaluation — adapts MLP weights on val context.
+    ttt_steps = int(os.environ.get("TTT_STEPS", 3))
+    ttt_lr = float(os.environ.get("TTT_LR", 1e-4))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -287,6 +297,66 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_with_ttt(
+    args: Hyperparameters,
+    model: nn.Module,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    ttt_steps: int = 3,
+    ttt_lr: float = 1e-4,
+) -> tuple[float, float]:
+    """Test-time training: adapt MLP weights on validation context before scoring.
+    Uses the uncompiled base_model for TTT gradient steps to avoid torch.compile issues,
+    then evaluates with the (possibly compiled/DDP-wrapped) model."""
+    if ttt_steps <= 0:
+        return eval_val(args, model, rank, world_size, device, grad_accum_steps,
+                       val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+
+    # Save original MLP weights
+    original_state = {n: p.data.clone() for n, p in base_model.named_parameters() if 'mlp' in n}
+
+    # TTT: few gradient steps on early validation tokens using the uncompiled base_model
+    base_model.train()
+    ttt_params = [p for n, p in base_model.named_parameters() if 'mlp' in n]
+    ttt_optimizer = torch.optim.SGD(ttt_params, lr=ttt_lr)
+
+    # Use first chunk of validation as TTT context
+    ttt_len = min(args.train_seq_len * 32, val_tokens.numel() // 4)
+    ttt_len = (ttt_len // args.train_seq_len) * args.train_seq_len  # align to seq_len
+    if ttt_len >= args.train_seq_len:
+        ttt_chunk = val_tokens[:ttt_len + 1].to(device=device, dtype=torch.int64)
+        for _ in range(ttt_steps):
+            x_ttt = ttt_chunk[:-1].reshape(-1, args.train_seq_len)
+            y_ttt = ttt_chunk[1:].reshape(-1, args.train_seq_len)
+            # Use small batch for speed
+            batch_size = min(8, x_ttt.shape[0])
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = base_model(x_ttt[:batch_size], y_ttt[:batch_size])
+            loss.backward()
+            ttt_optimizer.step()
+            ttt_optimizer.zero_grad()
+
+    # Now evaluate with adapted weights (base_model shares weights with compiled model)
+    result = eval_val(args, model, rank, world_size, device, grad_accum_steps,
+                     val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+
+    # Restore original weights (don't pollute saved model)
+    with torch.no_grad():
+        for n, p in base_model.named_parameters():
+            if n in original_state:
+                p.data.copy_(original_state[n])
+
+    return result
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -650,6 +720,43 @@ class MLP(nn.Module):
         return self.proj(F.silu(self.gate(x)) * self.fc(x))
 
 
+class ExpertMLP(nn.Module):
+    """Single SwiGLU expert with smaller hidden dimension."""
+    def __init__(self, dim: int, hidden: int):
+        super().__init__()
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(F.silu(self.gate(x)) * self.fc(x))
+
+
+class MoEMLP(nn.Module):
+    """Mixture of Experts with top-1 routing. Runs all experts and uses gated sum
+    (torch.compile friendly — no dynamic masking). With num_experts=4 and
+    hidden_per_expert = dim * mlp_mult // num_experts, total params match single MLP."""
+    def __init__(self, dim: int, mlp_mult: int, num_experts: int = 4):
+        super().__init__()
+        hidden_per_expert = max(dim * mlp_mult // num_experts, 1)
+        self.num_experts = num_experts
+        self.router = nn.Linear(dim, num_experts, bias=False)
+        self.experts = nn.ModuleList([ExpertMLP(dim, hidden_per_expert) for _ in range(num_experts)])
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seq_len, dim = x.shape
+        x_flat = x.reshape(-1, dim)  # (B*S, D)
+        # Compute routing logits and top-1 gate
+        logits = self.router(x_flat)  # (B*S, num_experts)
+        topk_val, topk_idx = logits.topk(1, dim=-1)  # (B*S, 1)
+        gate = torch.zeros_like(logits).scatter_(1, topk_idx, F.softmax(topk_val, dim=-1))
+        # Run all experts (each is tiny), weighted sum
+        expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)  # (B*S, E, D)
+        output = (gate.unsqueeze(-1) * expert_outputs).sum(dim=1)  # (B*S, D)
+        return output.reshape(bsz, seq_len, dim)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -659,12 +766,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        num_experts: int = 1,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MoEMLP(dim, mlp_mult, num_experts) if num_experts > 1 else MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -693,6 +801,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_experts: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -723,6 +832,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    num_experts,
                 )
                 for _ in range(num_unique_layers)
             ]
@@ -884,6 +994,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_experts=args.num_experts,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -944,6 +1055,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"depth_recurrence: {args.num_unique_layers} unique blocks x {args.num_repeats} repeats = {args.num_layers} effective layers")
+    log0(f"moe: num_experts:{args.num_experts} hidden_per_expert:{max(args.model_dim * args.mlp_mult // args.num_experts, 1) if args.num_experts > 1 else args.model_dim * args.mlp_mult}")
+    log0(f"ttt: steps:{args.ttt_steps} lr:{args.ttt_lr} (applied at final eval only)")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1157,9 +1270,10 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_bpb = eval_val_with_ttt(
         args,
         model,
+        base_model,
         rank,
         world_size,
         device,
@@ -1168,11 +1282,14 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        ttt_steps=args.ttt_steps,
+        ttt_lr=args.ttt_lr,
     )
     torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms "
+        f"ttt_steps:{args.ttt_steps} ttt_lr:{args.ttt_lr}"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 

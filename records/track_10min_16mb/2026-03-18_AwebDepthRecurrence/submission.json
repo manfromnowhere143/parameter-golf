@@ -1,8 +1,8 @@
 {
   "author": "Daniel Wahnich",
   "github_id": "manfromnowhere143",
-  "name": "Aweb Depth Recurrence",
-  "blurb": "4 unique transformer blocks × 6 repeats = 24 effective layers at 768 dim. Universal Transformer-style weight sharing gives 2.67× the depth of the baseline (24 vs 9 layers) with similar parameter count (~17M). U-Net skip connections cycle through shared blocks. Same Muon + Adam optimizers, same int8+zlib quantization.",
+  "name": "Aweb Depth Recurrence + MoE + TTT",
+  "blurb": "4 unique blocks × 6 repeats = 24 effective layers at 768 dim with 4-expert MoE routing, SwiGLU activation, Quantization-Aware Training, and Test-Time Training at eval. Weight sharing gives 2.67× depth of baseline with same param budget. MoE specializes 4 tiny experts per block (192 hidden each). QAT trains through int8 noise. TTT adapts MLP weights on validation context before final scoring.",
   "date": "2026-03-18T21:00:00Z",
   "val_loss": null,
   "val_bpb": null,
