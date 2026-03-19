@@ -95,8 +95,8 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Test-time training (TTT) during evaluation — adapts MLP weights on val context.
-    ttt_steps = int(os.environ.get("TTT_STEPS", 3))
-    ttt_lr = float(os.environ.get("TTT_LR", 1e-4))
+    ttt_steps = int(os.environ.get("TTT_STEPS", 50))
+    ttt_lr = float(os.environ.get("TTT_LR", 3e-5))
 
     # Per-loop LoRA adapters (fp32 low-rank for per-repeat specialization).
     lora_rank = int(os.environ.get("LORA_RANK", 16))
@@ -321,36 +321,36 @@ def eval_val_with_ttt(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
-    ttt_steps: int = 3,
-    ttt_lr: float = 1e-4,
+    ttt_steps: int = 50,
+    ttt_lr: float = 3e-5,
 ) -> tuple[float, float]:
-    """Test-time training: adapt MLP weights on validation context before scoring.
+    """Test-time training: adapt ALL weights on random validation windows before scoring.
     Uses the uncompiled base_model for TTT gradient steps to avoid torch.compile issues,
     then evaluates with the (possibly compiled/DDP-wrapped) model."""
     if ttt_steps <= 0:
         return eval_val(args, model, rank, world_size, device, grad_accum_steps,
                        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
 
-    # Save original MLP weights
-    original_state = {n: p.data.clone() for n, p in base_model.named_parameters() if 'mlp' in n}
+    # Save ALL original weights
+    original_state = {n: p.data.clone() for n, p in base_model.named_parameters()}
 
-    # TTT: few gradient steps on early validation tokens using the uncompiled base_model
+    # TTT: gradient steps on random validation windows using the uncompiled base_model
     base_model.train()
-    ttt_params = [p for n, p in base_model.named_parameters() if 'mlp' in n]
-    ttt_optimizer = torch.optim.SGD(ttt_params, lr=ttt_lr)
+    ttt_optimizer = torch.optim.Adam(
+        [p for p in base_model.parameters() if p.requires_grad],
+        lr=ttt_lr, betas=(0.9, 0.95),
+    )
 
-    # Use first chunk of validation as TTT context
-    ttt_len = min(args.train_seq_len * 32, val_tokens.numel() // 4)
-    ttt_len = (ttt_len // args.train_seq_len) * args.train_seq_len  # align to seq_len
-    if ttt_len >= args.train_seq_len:
-        ttt_chunk = val_tokens[:ttt_len + 1].to(device=device, dtype=torch.int64)
+    seq_len = args.train_seq_len
+    usable = val_tokens.numel() - 1
+    if usable >= seq_len:
         for _ in range(ttt_steps):
-            x_ttt = ttt_chunk[:-1].reshape(-1, args.train_seq_len)
-            y_ttt = ttt_chunk[1:].reshape(-1, args.train_seq_len)
-            # Use small batch for speed
-            batch_size = min(8, x_ttt.shape[0])
+            start = torch.randint(0, usable - seq_len, (1,)).item()
+            chunk = val_tokens[start:start + seq_len + 1].to(device=device, dtype=torch.int64)
+            x = chunk[:-1].unsqueeze(0)
+            y = chunk[1:].unsqueeze(0)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = base_model(x_ttt[:batch_size], y_ttt[:batch_size])
+                loss = base_model(x, y)
             loss.backward()
             ttt_optimizer.step()
             ttt_optimizer.zero_grad()
