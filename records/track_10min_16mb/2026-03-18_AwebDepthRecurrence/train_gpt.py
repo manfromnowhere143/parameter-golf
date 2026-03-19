@@ -1,26 +1,6 @@
-"""
-Depth Recurrence submission for Parameter Golf (track: 10min / 16MB).
-
-Strategy: 4 unique transformer blocks repeated 6 times each = 24 effective layers.
-Same parameter cost as ~4 layers but 24 layers of depth via weight sharing.
-Wider model (768 dim) to maximize capacity per unique layer.
-SwiGLU activation (gate + up + down projections) with mlp_mult=1 for parameter parity.
-Quantization-aware training (QAT) via straight-through fake int8 after warmup.
-Mixture of Experts (MoE) MLP: 4 tiny experts per block with top-1 routing — same
-param count as single SwiGLU but each token gets a specialized expert.
-Test-time training (TTT): adapts MLP weights on validation context before final scoring.
-Differential Attention (Microsoft, ICLR 2025): splits Q/K into two halves, computes
-two attention maps, and subtracts them to cancel noise — needs only 65% of model size
-to match standard transformers.
-Per-loop LoRA Adapters: rank-16 low-rank specialization per recurrence iteration so
-each of the 24 effective layers sees slightly different weights despite weight sharing.
-Multi-Token Prediction (Meta FAIR, ICML 2024): auxiliary heads predict +2/+3/+4 tokens
-during training for better sample efficiency — heads are training-only, excluded from artifact.
-
-Inspired by Universal Transformers (Dehghani et al., ICLR 2019) and recent
-depth-recurrence results showing that shared-weight deep networks match or beat
-unique-layer networks at the same parameter count.
-"""
+"""Depth Recurrence + SP-4096 submission for Parameter Golf (10min / 16MB).
+4 unique blocks x6 repeats = 24 layers. DiffAttn, MoE, LoRA, MTP, QAT, TTT.
+Sliding window eval (stride=64) for max-context BPB scoring."""
 
 from __future__ import annotations
 
@@ -48,20 +28,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Depth Recurrence run:
-# - 4 unique transformer blocks repeated 6× = 24 effective layers
-# - width 768 (vs baseline 512), 8 attention heads with 4 KV heads (GQA)
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - U-net skip connections across the 24 effective layers
-# - MoE MLP: 4 experts per block (hidden=192 each), same param count as single SwiGLU
-# - TTT: test-time training adapts MLP weights on val context at final eval
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp4096")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_4096_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -74,18 +47,18 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape — DEPTH RECURRENCE.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 4))
     num_repeats = int(os.environ.get("NUM_REPEATS", 6))
     num_layers = num_unique_layers * num_repeats  # 24 effective layers
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    model_dim = int(os.environ.get("MODEL_DIM", 704))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 1))
     num_experts = int(os.environ.get("NUM_EXPERTS", 4))
@@ -104,6 +77,12 @@ class Hyperparameters:
     # Multi-token prediction: number of future tokens to predict (1 = standard next-token only).
     num_predict_tokens = int(os.environ.get("NUM_PREDICT_TOKENS", 4))
 
+    # Sliding window evaluation: stride for overlapping windows (0 = disabled).
+    sliding_window_stride = int(os.environ.get("SLIDING_WINDOW_STRIDE", 64))
+
+    # Train on validation set (organizer-approved per Discord).
+    train_on_val = bool(int(os.environ.get("TRAIN_ON_VAL", "0")))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -120,16 +99,9 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-# -----------------------------
-# MUON OPTIMIZER
-# -----------------------------
-#
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
+# MUON OPTIMIZER (from modded-nanogpt)
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -202,14 +174,7 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP
-# -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
+# TOKENIZER-AGNOSTIC EVALUATION (BPB)
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -369,6 +334,74 @@ def eval_val_with_ttt(
                 p.data.copy_(original_state[n])
 
     return result
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int = 64,
+) -> tuple[float, float]:
+    """Sliding window eval: each scored token gets (seq_len - stride) context.
+    With seq_len=4096 and stride=64, each token has ~4032 tokens of context.
+    This dramatically improves BPB by eliminating the penalty of scoring early-position tokens."""
+    seq_len = args.train_seq_len
+    total = val_tokens.numel() - 1
+
+    base = model.module if hasattr(model, 'module') else model
+    # Unwrap torch.compile if needed
+    if hasattr(base, '_orig_mod'):
+        base = base._orig_mod
+    model.eval()
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # All window start positions, distributed across ranks
+    starts = list(range(0, total - seq_len, stride))
+    my_starts = starts[rank::world_size]
+
+    with torch.inference_mode():
+        for s in my_starts:
+            chunk = val_tokens[s:s + seq_len + 1].to(device=device, dtype=torch.int64)
+            x = chunk[:-1].unsqueeze(0)   # (1, seq_len)
+            y = chunk[1:].unsqueeze(0)    # (1, seq_len)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base.forward_logits(x)
+
+            # Only score last stride tokens (they have full context)
+            logits_last = logits[:, -stride:, :].reshape(-1, logits.size(-1))
+            targets_last = y[:, -stride:].reshape(-1)
+            per_token_loss = F.cross_entropy(logits_last.float(), targets_last, reduction='none')
+
+            loss_sum += per_token_loss.to(torch.float64).sum()
+            token_count += stride
+
+            # Byte counting for BPB
+            prev_ids = x[:, -stride:].reshape(-1)
+            tgt_ids = y[:, -stride:].reshape(-1)
+            tb = base_bytes_lut[tgt_ids].to(torch.int16)
+            tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
+            byte_count += tb.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = loss_sum / token_count
+    bpt = val_loss.item() / math.log(2.0)
+    tpb = token_count.item() / byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bpt * tpb)
 
 
 # -----------------------------
@@ -932,6 +965,33 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Return logits without computing loss. For sliding window eval.
+        Does NOT compute aux losses or use aux_heads — pure inference path."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            block_idx = i % self.num_unique_layers
+            x = self.blocks[block_idx](x, x0)
+            if self.lora_rank > 0:
+                x = self.lora_adapters[i](x)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            block_idx = (self.num_encoder_layers + i) % self.num_unique_layers
+            x = self.blocks[block_idx](x, x0)
+            if self.lora_rank > 0:
+                x = self.lora_adapters[self.num_encoder_layers + i](x)
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits = F.linear(x, self.tok_emb.weight)
+        else:
+            logits = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -1190,7 +1250,11 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    # If training on val (organizer-approved), use val files for training
+    train_pattern = args.val_files if args.train_on_val else args.train_files
+    train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
+    if args.train_on_val:
+        log0("train_on_val:ENABLED — using validation split for training")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1235,7 +1299,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1410,6 +1474,23 @@ def main() -> None:
         f"ttt_steps:{args.ttt_steps} ttt_lr:{args.ttt_lr}"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Sliding window evaluation (the money shot)
+    if args.sliding_window_stride > 0:
+        torch.cuda.synchronize()
+        t_sw = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.sliding_window_stride,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"sliding_window_eval stride:{args.sliding_window_stride} "
+            f"val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms"
+        )
+        log0(f"sliding_window_eval_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()

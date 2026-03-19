@@ -8,8 +8,8 @@ same size budget. Normal: ~17M params x 8 bits = ~16MB. BitNet: ~50-60M params x
 Architecture:
 - BitLinear layers with ternary quantization (absmean) and straight-through estimator
 - 6 unique transformer blocks repeated 8 times each = 48 effective depth
-- model_dim=1024, 16 attention heads, 8 KV heads (GQA), head_dim=64
-- MoE MLP: 4 experts per block (hidden=256 each)
+- model_dim=768, 16 attention heads, 8 KV heads (GQA), head_dim=48
+- MoE MLP: 4 experts per block (hidden=192 each)
 - Differential Attention (Microsoft, ICLR 2025)
 - SwiGLU activation with ternary weights
 - U-net skip connections across 48 effective layers
@@ -51,18 +51,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # BitNet 1.58-bit run:
 # - 6 unique transformer blocks repeated 8x = 48 effective layers
-# - width 1024, 16 attention heads with 8 KV heads (GQA)
-# - vocab size 1024, sequence length 1024, tied embeddings
+# - width 768, 16 attention heads with 8 KV heads (GQA)
+# - vocab size 4096, sequence length 4096, tied embeddings
 # - U-net skip connections across the 48 effective layers
 # - MoE MLP: 4 experts per block (hidden=256 each)
 # - TTT: test-time training adapts MLP weights on val context at final eval
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp4096")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_4096_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -75,18 +75,18 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape — BITNET 1.58-BIT with DEPTH RECURRENCE.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 6))
     num_repeats = int(os.environ.get("NUM_REPEATS", 8))
     num_layers = num_unique_layers * num_repeats  # 48 effective layers
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
-    model_dim = int(os.environ.get("MODEL_DIM", 1024))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 16))
     mlp_mult = int(os.environ.get("MLP_MULT", 1))
     num_experts = int(os.environ.get("NUM_EXPERTS", 4))
@@ -103,6 +103,12 @@ class Hyperparameters:
 
     # Multi-token prediction (Meta FAIR): aux heads predict k+1..k+N tokens ahead.
     num_predict_tokens = int(os.environ.get("NUM_PREDICT_TOKENS", 4))
+
+    # Sliding window evaluation stride (0 to disable).
+    sliding_window_stride = int(os.environ.get("SLIDING_WINDOW_STRIDE", 64))
+
+    # Train on validation set (for overfitting experiments).
+    train_on_val = bool(int(os.environ.get("TRAIN_ON_VAL", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -360,6 +366,59 @@ def eval_val_with_ttt(
                 p.data.copy_(original_state[n])
 
     return result
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int = 64,
+) -> tuple[float, float]:
+    """Sliding window evaluation for more accurate val_bpb measurement."""
+    seq_len = args.train_seq_len
+    total = val_tokens.numel() - 1
+    base = model.module if hasattr(model, 'module') else model
+    # If model is compiled, get the underlying module
+    if hasattr(base, '_orig_mod'):
+        base = base._orig_mod
+    model.eval()
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    starts = list(range(0, total - seq_len, stride))
+    my_starts = starts[rank::world_size]
+    with torch.inference_mode():
+        for s in my_starts:
+            chunk = val_tokens[s:s+seq_len+1].to(device=device, dtype=torch.int64)
+            x = chunk[:-1].unsqueeze(0)
+            y = chunk[1:].unsqueeze(0)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base.forward_logits(x)
+            logits_last = logits[:, -stride:, :].reshape(-1, logits.size(-1))
+            targets_last = y[:, -stride:].reshape(-1)
+            per_token_loss = F.cross_entropy(logits_last.float(), targets_last, reduction='none')
+            loss_sum += per_token_loss.to(torch.float64).sum()
+            token_count += stride
+            prev_ids = x[:, -stride:].reshape(-1)
+            tgt_ids = y[:, -stride:].reshape(-1)
+            tb = base_bytes_lut[tgt_ids].to(torch.int16)
+            tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
+            byte_count += tb.to(torch.float64).sum()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+    val_loss = loss_sum / token_count
+    bpt = val_loss.item() / math.log(2.0)
+    tpb = token_count.item() / byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bpt * tpb)
 
 
 # -----------------------------
@@ -907,6 +966,32 @@ class GPT(nn.Module):
             if isinstance(module, (nn.Linear, BitLinear)) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Return logits for sliding window eval. No loss, no aux heads."""
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            block_idx = i % self.num_unique_layers
+            x = self.blocks[block_idx](x, x0)
+            if self.lora_rank > 0:
+                x = self.lora_adapters[i](x)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            block_idx = (self.num_encoder_layers + i) % self.num_unique_layers
+            x = self.blocks[block_idx](x, x0)
+            if self.lora_rank > 0:
+                x = self.lora_adapters[self.num_encoder_layers + i](x)
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits = F.linear(x, self.tok_emb.weight)
+        else:
+            logits = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -1184,7 +1269,8 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_pattern = args.val_files if args.train_on_val else args.train_files
+    train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1229,7 +1315,7 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1395,6 +1481,14 @@ def main() -> None:
         f"ttt_steps:{args.ttt_steps} ttt_lr:{args.ttt_lr}"
     )
     log0(f"final_ternary_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if args.sliding_window_stride > 0:
+        sw_loss, sw_bpb = eval_val_sliding(
+            args, model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.sliding_window_stride,
+        )
+        log0(f"final_sliding_window stride:{args.sliding_window_stride} val_loss:{sw_loss:.8f} val_bpb:{sw_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
