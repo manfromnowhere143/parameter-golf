@@ -830,7 +830,7 @@ class MoEMLP(nn.Module):
         # Compute routing logits and top-1 gate
         logits = self.router(x_flat)  # (B*S, num_experts)
         topk_val, topk_idx = logits.topk(1, dim=-1)  # (B*S, 1)
-        gate = torch.zeros_like(logits).scatter_(1, topk_idx, F.softmax(topk_val, dim=-1))
+        gate = torch.zeros_like(logits).scatter_(1, topk_idx, F.softmax(topk_val, dim=-1).to(logits.dtype))
         # Run all experts (each is tiny), weighted sum
         expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)  # (B*S, E, D)
         output = (gate.unsqueeze(-1) * expert_outputs).sum(dim=1)  # (B*S, D)
