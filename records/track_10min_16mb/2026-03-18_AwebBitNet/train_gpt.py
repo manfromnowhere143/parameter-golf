@@ -774,10 +774,14 @@ class CausalSelfAttention(nn.Module):
         q1 = q1 * gain
         q2 = q2 * gain
 
-        # Compute two attention outputs using SDPA
-        gqa = self.num_kv_heads != self.num_heads
-        attn1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True, enable_gqa=gqa)
-        attn2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True, enable_gqa=gqa)
+        # Expand KV heads to match Q heads (GQA) for SDPA compatibility
+        if self.num_kv_heads != self.num_heads:
+            rep = self.num_heads // self.num_kv_heads
+            k1 = k1.repeat_interleave(rep, dim=1)
+            k2 = k2.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        attn1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True)
+        attn2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True)
 
         # Compute learnable lambda
         lambda_val = (torch.exp(self.lambda_q1.to(q1.dtype)) * torch.exp(self.lambda_k1.to(q1.dtype))).sum(-1)
