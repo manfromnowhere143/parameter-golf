@@ -746,46 +746,30 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.half_head_dim).transpose(1, 2)
 
-        # Split Q and K into two halves for differential attention
+        # Split Q and K into two halves
         q1, q2 = q[..., :self.half_head_dim], q[..., self.half_head_dim:]
         k1, k2 = k[..., :self.half_head_dim], k[..., self.half_head_dim:]
 
-        # Apply RMSNorm to each half separately
+        # Apply RMSNorm
         q1 = F.rms_norm(q1, (q1.size(-1),))
-        q2 = F.rms_norm(q2, (q2.size(-1),))
         k1 = F.rms_norm(k1, (k1.size(-1),))
-        k2 = F.rms_norm(k2, (k2.size(-1),))
 
-        # Apply RoPE to each half
+        # Apply RoPE
         cos, sin = self.rotary(seqlen, x.device, q1.dtype)
         q1 = apply_rotary_emb(q1, cos, sin)
-        q2 = apply_rotary_emb(q2, cos, sin)
         k1 = apply_rotary_emb(k1, cos, sin)
-        k2 = apply_rotary_emb(k2, cos, sin)
 
         # Apply q_gain
         gain = self.q_gain.to(dtype=q1.dtype)[None, :, None, None]
         q1 = q1 * gain
-        q2 = q2 * gain
 
         # Expand KV heads to match Q heads (GQA) for SDPA compatibility
         if self.num_kv_heads != self.num_heads:
             rep = self.num_heads // self.num_kv_heads
             k1 = k1.repeat_interleave(rep, dim=1)
-            k2 = k2.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
-        # Flash attention — Q/K/V all have half_head_dim now
-        attn1 = F.scaled_dot_product_attention(q1, k1, v, is_causal=True)
-        attn2 = F.scaled_dot_product_attention(q2, k2, v, is_causal=True)
-
-        # Compute learnable lambda
-        lambda_val = (torch.exp(self.lambda_q1.to(q1.dtype)) * torch.exp(self.lambda_k1.to(q1.dtype))).sum(-1)
-        lambda_val = lambda_val - (torch.exp(self.lambda_q2.to(q1.dtype)) * torch.exp(self.lambda_k2.to(q1.dtype))).sum(-1)
-        lambda_val = lambda_val + self.lambda_init
-        lambda_val = lambda_val[None, :, None, None]  # (1, H, 1, 1)
-
-        # Differential attention: subtract noise attention, scaled by lambda
-        y = attn1 - lambda_val * attn2
+        # Standard flash attention — single SDPA call
+        y = F.scaled_dot_product_attention(q1, k1, v, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, self.num_heads * self.half_head_dim)
         return self.proj(y)
