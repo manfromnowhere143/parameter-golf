@@ -20,6 +20,11 @@ except ImportError:
 import numpy as np
 import sentencepiece as spm
 import torch
+import torch._dynamo
+# Bump dynamo cache_size_limit from default 8 → 64 to handle the additional
+# graph variants introduced by depth recurrence (pre/post curriculum, varying
+# TTT chunk shapes during eval). Prevents FailOnRecompileLimitHit crash.
+torch._dynamo.config.cache_size_limit = 64
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
