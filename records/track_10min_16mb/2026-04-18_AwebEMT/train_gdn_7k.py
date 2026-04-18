@@ -38,6 +38,12 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 import torch
+import torch._dynamo
+# Bump dynamo cache_size_limit from default 8 → 64. FLA's GDN layer triggers
+# recompilations for each layer_idx (L['self'].layer_idx == N), exceeding the
+# default limit at L=8+ with 10-layer model. Recompiles cause ~40% wall-clock
+# slowdown AND fragment GPU memory contributing to OOM.
+torch._dynamo.config.cache_size_limit = 64
 import torch.distributed as dist
 import torch.nn.functional as F
 import zstandard
@@ -73,8 +79,12 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Validation
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    # Disable mid-training val by default: it triggers an additional forward pass
+    # on a larger batch that pushes 8×H100-80GB over the edge when combined with
+    # EMT (teacher model) + GDN activations. Final val runs at end regardless.
+    # Override to a small positive number if mid-training val is needed.
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 99999))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 262_144))  # halved default
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
     save_every = int(os.environ.get("SAVE_EVERY", 1000))
 
