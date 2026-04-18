@@ -1350,9 +1350,29 @@ def main():
     log0(f"\nTraining complete in {elapsed_total:.0f}s")
     log0(f"Peak memory: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
+    # Free training-only GPU state before eval. Optimizer momenta, EMT teacher,
+    # and torch.compile caches together consume ~20GB that eval doesn't need.
+    # Without this, EMA-application + eval_val_sliding OOM on 80GB H100.
+    log0("Freeing training state (optimizers, teacher, caches) before eval...")
+    try:
+        del muon_opt, adam_opt
+    except NameError:
+        pass
+    if teacher_model is not None:
+        teacher_model = teacher_model.to("cpu")
+        del teacher_model
+    # Clear gradients on all model params
+    for p in base_model.parameters():
+        p.grad = None
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    log0(f"  Post-cleanup GPU memory: {torch.cuda.memory_allocated() // 1024 // 1024} MiB allocated")
+
     log0("\n=== Applying EMA weights ===")
     avg_state = {name: t.to(dtype=base_model.state_dict()[name].dtype) for name, t in ema_state.items()}
     base_model.load_state_dict(avg_state, strict=True)
+    torch.cuda.empty_cache()
 
     # Eval EMA weights
     val_loss_ema, val_bpb_ema = eval_val_sliding(
