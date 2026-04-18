@@ -69,7 +69,8 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 14100.0))  # 3h55m safety
+    # Competition default: 600s (10-min track). Override via env var for long runs.
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Validation
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
@@ -853,7 +854,13 @@ def main():
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    grad_accum_steps = max(1, 8 // world_size)
+    # Grad accum: default 1 at world_size>=8; bump to 2 when EMT is enabled to make
+    # room for the teacher-model forward (else ~60GB student + ~8GB teacher activations
+    # = OOM on 80GB H100). Can be overridden via GRAD_ACCUM_STEPS env var.
+    _default_grad_accum = max(1, 8 // world_size)
+    if args.emt_enabled and _default_grad_accum < 2:
+        _default_grad_accum = 2
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", _default_grad_accum))
     master_process = rank == 0
 
     if not torch.cuda.is_available():
@@ -1030,20 +1037,31 @@ def main():
     # Aweb signature: maintain a SEPARATE teacher model that is periodically
     # synchronized from the EMA state. Teacher provides soft-label targets via
     # KL divergence in the student loss. Mean Teacher framework (Tarvainen 2017).
+    #
+    # LAZY INIT: teacher is only constructed when alpha first becomes > 0
+    # (at emt_warmup_start_step). Saves ~2GB GPU memory during pre-warmup training.
     teacher_model: HybridGDN | None = None
     emt_warmup_start_step = int(args.emt_warmup_start_frac * args.iterations)
     emt_warmup_end_step = int(args.emt_warmup_end_frac * args.iterations)
     if args.emt_enabled:
-        teacher_model = HybridGDN(config, args.vocab_size).to(device).bfloat16()
-        teacher_model.load_state_dict(base_model.state_dict())
-        teacher_model.eval()
-        for p in teacher_model.parameters():
-            p.requires_grad = False
-        log0(f"EMT: enabled alpha_max={args.emt_alpha_max} "
+        log0(f"EMT: enabled (LAZY teacher init at step {emt_warmup_start_step}) "
+             f"alpha_max={args.emt_alpha_max} "
              f"warmup={emt_warmup_start_step}->{emt_warmup_end_step} "
              f"teacher_update_every={args.emt_teacher_update_every} T={args.emt_temperature}")
     else:
         log0("EMT: disabled")
+
+    def _init_teacher_from_ema() -> HybridGDN:
+        """Construct teacher model on GPU and load EMA state into it."""
+        tm = HybridGDN(config, args.vocab_size).to(device).bfloat16()
+        with torch.no_grad():
+            tgt_state = tm.state_dict()
+            typed = {k: v.to(dtype=tgt_state[k].dtype) for k, v in ema_state.items() if k in tgt_state}
+            tm.load_state_dict(typed, strict=False)
+        tm.eval()
+        for p in tm.parameters():
+            p.requires_grad = False
+        return tm
 
     def emt_alpha_for(step: int) -> float:
         """Linear ramp 0 -> alpha_max between warmup_start and warmup_end."""
@@ -1146,7 +1164,12 @@ def main():
             CastedLinear._qat_enabled = True
             log0(f"Late QAT enabled at step {step} (lr_mul={lr_mul:.4f})")
 
-        # ─── EMT (Aweb signature): periodically refresh teacher from EMA state ─
+        # ─── EMT (Aweb signature) — lazy init + periodic refresh ────────────
+        cur_alpha = emt_alpha_for(step)
+        if args.emt_enabled and cur_alpha > 0.0 and teacher_model is None:
+            teacher_model = _init_teacher_from_ema()
+            log0(f"EMT: teacher lazy-initialized at step {step} (alpha={cur_alpha:.3f})")
+        # Periodic teacher refresh from EMA
         if (teacher_model is not None
                 and step > 0
                 and step % args.emt_teacher_update_every == 0):
@@ -1158,7 +1181,6 @@ def main():
         # Gradient accumulation
         model.train()
         total_loss = 0.0
-        cur_alpha = emt_alpha_for(step)
         x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
         micro_batch = x.shape[0] // grad_accum_steps
         for micro_step in range(grad_accum_steps):

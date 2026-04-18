@@ -2,6 +2,7 @@ numpy
 torch
 sentencepiece
 zstandard
+brotli
 flash-linear-attention==0.4.2
 fla-core==0.4.2
 triton==3.2.0
