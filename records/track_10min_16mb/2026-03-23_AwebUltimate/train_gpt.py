@@ -123,6 +123,16 @@ class Hyperparameters:
     slot_steps = int(os.environ.get("SLOT_STEPS", 16))
     slot_lr = float(os.environ.get("SLOT_LR", 0.008))
     slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.0008))
+    # Depth Recurrence (PR #1517 / #1331 / #1471 pattern): re-run selected encoder
+    # layers once more after encoder pass, NO skip push (preserves U-Net symmetry).
+    # Format: "2,3,4" (comma-separated layer indices); empty string = disabled.
+    recur_layers_str = os.environ.get("RECUR_LAYERS", "")
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 2000))
+    # Lookahead Optimizer (Zhang/Lucas/Hinton/Ba, NeurIPS 2019) - Aweb signature.
+    # Maintains slow weights; every k inner steps: slow = (1-a)*slow + a*fast; fast := slow.
+    lookahead_enabled = bool(int(os.environ.get("LOOKAHEAD_ENABLED", "1")))
+    lookahead_k = int(os.environ.get("LOOKAHEAD_K", 5))
+    lookahead_alpha = float(os.environ.get("LOOKAHEAD_ALPHA", 0.5))
     # N-gram oracle mixing
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", 12))  # order 2-12 backoff
@@ -829,8 +839,17 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        recur_layers_str: str = "",
     ):
         super().__init__()
+        # Depth recurrence: list of layer indices to re-run after encoder pass.
+        # No skip-stack push on recurrence (preserves U-Net 5-in/5-out symmetry).
+        # `recur_enabled` is toggled by the training loop at recur_start_step.
+        if recur_layers_str.strip():
+            self.recur_layers = [int(x) for x in recur_layers_str.split(",") if x.strip()]
+        else:
+            self.recur_layers = []
+        self.recur_enabled = False  # set True by training loop after warmup; True at eval
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -955,6 +974,15 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        # Depth recurrence: re-run selected encoder layers once more (no skip push).
+        # Preserves U-Net symmetry (skips list length unchanged).
+        if self.recur_enabled and self.recur_layers:
+            for ri in self.recur_layers:
+                ve = self._get_ve(ri, input_ids, ve_cache)
+                x, _ = self.blocks[ri](x, x0,
+                    self.qo_bank[ri], self.kv_bank[ri], self.kv_bank[n + ri],
+                    self.qo_bank[n + ri], self.mlp_up_bank[ri], self.mlp_down_bank[ri],
+                    v_embed=ve, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
@@ -1013,6 +1041,14 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        # Depth recurrence (mirrors forward()): no skip push, preserves U-Net.
+        if self.recur_enabled and self.recur_layers:
+            for ri in self.recur_layers:
+                ve = self._get_ve(ri, input_ids, ve_cache)
+                x, _ = self.blocks[ri](x, x0,
+                    self.qo_bank[ri], self.kv_bank[ri], self.kv_bank[n + ri],
+                    self.qo_bank[n + ri], self.mlp_up_bank[ri], self.mlp_down_bank[ri],
+                    v_embed=ve, v0=v0)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
@@ -1918,6 +1954,7 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        recur_layers_str=args.recur_layers_str,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2074,6 +2111,21 @@ def main() -> None:
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     ema_decay = 0.997
+    # Lookahead Optimizer (Aweb signature, Zhang et al. NeurIPS 2019).
+    # Slow weights snapshot for ALL trainable params; updated every k inner steps.
+    lookahead_slow: dict[str, Tensor] | None = None
+    if args.lookahead_enabled:
+        lookahead_slow = {n: p.detach().float().clone()
+                          for n, p in base_model.named_parameters() if p.requires_grad}
+        if rank == 0:
+            log0(f"lookahead:enabled k={args.lookahead_k} alpha={args.lookahead_alpha} "
+                 f"slow_params={len(lookahead_slow)}")
+    elif rank == 0:
+        log0("lookahead:disabled")
+    if base_model.recur_layers and rank == 0:
+        log0(f"recur:configured layers={base_model.recur_layers} start_step={args.recur_start_step}")
+    elif rank == 0:
+        log0("recur:disabled")
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -2153,6 +2205,22 @@ def main() -> None:
             for name, t in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
+        # Lookahead update (Aweb signature): every k inner steps,
+        # slow := (1-a)*slow + a*fast; fast := slow.
+        if lookahead_slow is not None and step % args.lookahead_k == 0:
+            with torch.no_grad():
+                for n, p in base_model.named_parameters():
+                    if n in lookahead_slow:
+                        slow = lookahead_slow[n]
+                        slow.mul_(1.0 - args.lookahead_alpha).add_(p.data.float(),
+                                                                   alpha=args.lookahead_alpha)
+                        p.data.copy_(slow.to(p.dtype))
+        # Depth recurrence curriculum: enable after warmup steps.
+        if (base_model.recur_layers and not base_model.recur_enabled
+                and step >= args.recur_start_step):
+            base_model.recur_enabled = True
+            if rank == 0:
+                log0(f"recur:activated step={step} layers={base_model.recur_layers}")
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
             if swa_state is None:
@@ -2264,7 +2332,10 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        recur_layers_str=args.recur_layers_str,
     ).to(device).bfloat16()
+    # Eval model always uses recurrence (if configured) — no curriculum at eval time.
+    eval_model.recur_enabled = bool(eval_model.recur_layers)
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
     eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
