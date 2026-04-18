@@ -123,6 +123,8 @@ class Hyperparameters:
     slot_steps = int(os.environ.get("SLOT_STEPS", 16))
     slot_lr = float(os.environ.get("SLOT_LR", 0.008))
     slot_lr_min = float(os.environ.get("SLOT_LR_MIN", 0.0008))
+    # Per-group EMA decay (decomposes scalar 0.997 baseline by parameter class)
+    per_group_ema = bool(int(os.environ.get("PER_GROUP_EMA", "1")))
     # N-gram oracle mixing
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", 12))  # order 2-12 backoff
@@ -2073,7 +2075,40 @@ def main() -> None:
     from collections import deque
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
-    ema_decay = 0.997
+    # Per-group EMA decay: decomposes scalar 0.997 baseline by parameter class.
+    # Theoretical basis: bias-variance tradeoff differs across param classes
+    # (embeddings track high-frequency vocab statistics, MLP banks encode
+    # slow-moving compositional features). Default groups preserve baseline 0.997.
+    def _ema_decay_for(name: str) -> float:
+        # Control tensors first (canonical list aligned with line 400):
+        # scale/resid_mix/q_gain/skip_weight/smear/dtg_gate/attn_gate/vr_lambda.
+        # Checked before embedding rule so bigram.scale and ve_shared.scale land
+        # in the scalar bucket rather than the embedding bucket.
+        control_tokens = ("scale", "resid_mix", "q_gain", "skip_weight",
+                          "smear", "dtg_gate", "attn_gate", "vr_lambda")
+        if any(tok in name for tok in control_tokens):
+            return 0.995
+        if "tok_emb" in name or "bigram" in name or "ve_shared" in name:
+            return 0.99   # embeddings: fast (vocab statistics)
+        if "mlp_up_bank" in name or "mlp_down_bank" in name:
+            return 0.999  # MLP banks: slow (feature-stable)
+        if "lm_head" in name or "mtp_heads" in name:
+            return 0.995  # output heads: medium-fast
+        if "norm" in name:
+            return 0.995  # norms (RMSNorm here is param-less; safety)
+        return 0.997      # default: qo_bank, kv_bank, rotary buffers
+    if args.per_group_ema:
+        ema_decays = {n: _ema_decay_for(n) for n in base_model.state_dict().keys()}
+        if rank == 0:
+            from collections import Counter
+            log0(f"per_group_ema:enabled summary={dict(Counter(ema_decays.values()))}")
+            for n, d in sorted(ema_decays.items()):
+                if d != 0.997:
+                    log0(f"per_group_ema:{n}={d}")
+    else:
+        ema_decays = {n: 0.997 for n in base_model.state_dict().keys()}
+        if rank == 0:
+            log0("per_group_ema:disabled (baseline scalar 0.997)")
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -2148,10 +2183,11 @@ def main() -> None:
         # Phase 3: Wait for RS, local NS5, all-gather (banks processed last)
         optimizer_muon.step()
         zero_grad_all()
-        # EMA update
+        # EMA update (per-group decay: lookup precomputed map)
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+                d = ema_decays[name]
+                ema_state[name].mul_(d).add_(t.detach().float(), alpha=1.0 - d)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
