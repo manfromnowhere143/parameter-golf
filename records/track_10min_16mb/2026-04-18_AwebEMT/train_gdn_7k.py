@@ -1453,28 +1453,53 @@ def main():
             p.data = p.data.float()
     eval_model.load_state_dict(deq_state, strict=True)
 
-    # Eval quantized model without XSA
-    val_loss_q, val_bpb_q = eval_val_sliding(
-        eval_model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        rank, world_size, device,
-        seq_len=args.eval_seq_len, stride=args.eval_stride,
-        xsa_eval=False,
-        compile_enabled=args.eval_compile_enabled,
-    )
-    log0(f"Quantized BPB (no XSA): {val_bpb_q:.6f}")
-    log0(f"Quantization degradation: {val_bpb_q - val_bpb_ema:+.6f}")
+    # Clean up GPU before quantized eval — fresh torch.compile graph from prior
+    # eval_val_sliding call retains ~60-75GB compile buffers even after its call.
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    log0(f"Pre-quant-eval GPU memory: {torch.cuda.memory_allocated() // 1024 // 1024} MiB allocated")
+
+    # Eval quantized model without XSA (compile disabled to avoid OOM; try/except resilience)
+    try:
+        val_loss_q, val_bpb_q = eval_val_sliding(
+            eval_model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            rank, world_size, device,
+            seq_len=args.eval_seq_len, stride=args.eval_stride,
+            xsa_eval=False,
+            compile_enabled=False,
+        )
+        log0(f"Quantized BPB (no XSA): {val_bpb_q:.6f}")
+        log0(f"Quantization degradation: {val_bpb_q - val_bpb_ema:+.6f}")
+    except torch.cuda.OutOfMemoryError as e:
+        log0(f"Quantized BPB eval OOM'd (non-fatal): {e}")
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
+        val_bpb_q = float("nan")
+        val_loss_q = float("nan")
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
 
     # Eval quantized model WITH XSA (if model has SWA layers)
     block_types = eval_model._block_types
     if any(bt in ("swa", "swa_shared") for bt in block_types):
-        val_loss_qx, val_bpb_qx = eval_val_sliding(
-            eval_model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            rank, world_size, device,
-            seq_len=args.eval_seq_len, stride=args.eval_stride,
-            xsa_eval=True,
-            compile_enabled=args.eval_compile_enabled,
-        )
-        log0(f"Quantized BPB (XSA-all): {val_bpb_qx:.6f}")
+        try:
+            val_loss_qx, val_bpb_qx = eval_val_sliding(
+                eval_model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                rank, world_size, device,
+                seq_len=args.eval_seq_len, stride=args.eval_stride,
+                xsa_eval=True,
+                compile_enabled=False,
+            )
+            log0(f"Quantized BPB (XSA-all): {val_bpb_qx:.6f}")
+        except torch.cuda.OutOfMemoryError as e:
+            log0(f"Quantized XSA BPB eval OOM'd (non-fatal): {e}")
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
+            val_bpb_qx = float("nan")
+            val_loss_qx = float("nan")
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
 
     # ─── Final Summary ───────────────────────────────────────────────────
     log0(f"\n{'='*80}")
@@ -1491,20 +1516,30 @@ def main():
 
     # ─── Legal Score-First TTT ────────────────────────────────────────────
     if args.ttt_enabled:
+        # Clean GPU again before TTT (fresh compile cache for TTT forward path)
+        torch._dynamo.reset()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        log0(f"Pre-TTT GPU memory: {torch.cuda.memory_allocated() // 1024 // 1024} MiB allocated")
+
         log0("\n=== Legal Score-First TTT (GDN) ===")
-        torch.cuda.synchronize()
         t_ttt = time.perf_counter()
-        ttt_loss, ttt_bpb = eval_val_ttt_gdn(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, batch_seqs=args.ttt_batch_seqs, log0=log0,
-        )
-        torch.cuda.synchronize()
-        ttt_elapsed = time.perf_counter() - t_ttt
-        ttt_delta = ttt_bpb - val_bpb_q
-        log0(f"TTT BPB:          {ttt_bpb:.6f} (delta: {ttt_delta:+.6f})")
-        log0(f"TTT eval time:    {ttt_elapsed:.1f}s")
-        log0(f"final_int6_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        try:
+            ttt_loss, ttt_bpb = eval_val_ttt_gdn(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, batch_seqs=args.ttt_batch_seqs, log0=log0,
+            )
+            torch.cuda.synchronize()
+            ttt_elapsed = time.perf_counter() - t_ttt
+            ttt_delta = ttt_bpb - val_bpb_q if not math.isnan(val_bpb_q) else float("nan")
+            log0(f"TTT BPB:          {ttt_bpb:.6f} (delta: {ttt_delta:+.6f})")
+            log0(f"TTT eval time:    {ttt_elapsed:.1f}s")
+            log0(f"final_int6_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
+        except torch.cuda.OutOfMemoryError as e:
+            log0(f"TTT eval OOM'd: {e}")
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
 
     if distributed:
         dist.destroy_process_group()
