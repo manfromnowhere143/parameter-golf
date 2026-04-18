@@ -1374,15 +1374,24 @@ def main():
     base_model.load_state_dict(avg_state, strict=True)
     torch.cuda.empty_cache()
 
-    # Eval EMA weights
-    val_loss_ema, val_bpb_ema = eval_val_sliding(
-        model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        rank, world_size, device,
-        seq_len=args.eval_seq_len, stride=args.eval_stride,
-        xsa_eval=False,
-        compile_enabled=args.eval_compile_enabled,
-    )
-    log0(f"EMA BPB (no XSA): {val_bpb_ema:.6f}")
+    # Eval EMA weights (informational; skipped on OOM, final eval runs later via int6 path).
+    # Disable compile here to avoid a fresh compile cache eating 60-75GB on 80GB H100s
+    # that are already tight from training-phase graph retention.
+    try:
+        val_loss_ema, val_bpb_ema = eval_val_sliding(
+            model, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            rank, world_size, device,
+            seq_len=args.eval_seq_len, stride=args.eval_stride,
+            xsa_eval=False,
+            compile_enabled=False,  # disable compile to save memory
+        )
+        log0(f"EMA BPB (no XSA): {val_bpb_ema:.6f}")
+    except torch.cuda.OutOfMemoryError as e:
+        log0(f"EMA BPB eval OOM'd (non-fatal, informational only): {e}")
+        torch.cuda.empty_cache()
+        val_bpb_ema = float("nan")
+        val_loss_ema = float("nan")
+    torch.cuda.empty_cache()
 
     # Save raw EMA model
     if master_process:
