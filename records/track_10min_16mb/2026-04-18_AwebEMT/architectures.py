@@ -415,7 +415,8 @@ class HybridGDN(nn.Module):
 
     All models share: token embedding, bigram hash, smear gate, final norm, lm_head.
     """
-    def __init__(self, config: dict, vocab_size: int = 1024):
+    def __init__(self, config: dict, vocab_size: int = 1024,
+                 gradient_checkpoint: bool = False):
         super().__init__()
         dim = config["model_dim"]
         num_heads = config["num_heads"]
@@ -424,6 +425,10 @@ class HybridGDN(nn.Module):
         self.model_dim = dim
         self.vocab_size = vocab_size
         self.logit_softcap = 30.0
+        # Gradient checkpointing: recomputes block activations on backward pass.
+        # Halves activation memory at cost of ~25%% more compute.
+        # Essential when adding the EMA-Teacher model that adds ~2-4GB on top of base.
+        self.gradient_checkpoint = gradient_checkpoint
 
         # Embeddings
         self.tok_emb = nn.Embedding(vocab_size, dim)
@@ -648,8 +653,8 @@ class HybridGDN(nn.Module):
             x0 = torch.cat([meta, x0], dim=1)
 
         for block, btype in zip(self.blocks, self._block_types):
-            if btype in ("swa", "swa_shared"):
-                x = block(x, x0)
+            if self.gradient_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, x0, use_reentrant=False)
             else:
                 x = block(x, x0)
 

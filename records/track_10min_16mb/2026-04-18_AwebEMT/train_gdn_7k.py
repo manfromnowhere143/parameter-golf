@@ -119,10 +119,18 @@ class Hyperparameters:
     # Teacher = student weights smoothed by EMA at decay ema_decay.
     emt_enabled = bool(int(os.environ.get("EMT_ENABLED", "1")))
     emt_alpha_max = float(os.environ.get("EMT_ALPHA_MAX", 0.3))
-    emt_warmup_start_frac = float(os.environ.get("EMT_WARMUP_START_FRAC", 0.3))
-    emt_warmup_end_frac = float(os.environ.get("EMT_WARMUP_END_FRAC", 0.7))
+    emt_warmup_start_frac = float(os.environ.get("EMT_WARMUP_START_FRAC", 0.1))
+    emt_warmup_end_frac = float(os.environ.get("EMT_WARMUP_END_FRAC", 0.5))
     emt_teacher_update_every = int(os.environ.get("EMT_TEACHER_UPDATE_EVERY", 16))
     emt_temperature = float(os.environ.get("EMT_TEMPERATURE", 1.0))
+    # Teacher CPU offload: keeps teacher weights on host RAM, moves to GPU only
+    # for each forward pass. Eliminates the ~2GB persistent GPU footprint of
+    # the teacher model at cost of ~100ms per distillation step for transfer.
+    emt_teacher_on_cpu = bool(int(os.environ.get("EMT_TEACHER_ON_CPU", "1")))
+    # Gradient checkpointing on student: recomputes block activations on
+    # backward pass. Halves activation memory at ~25%% compute cost.
+    # Required when EMT is active and 8×H100 80GB is tight.
+    gradient_checkpoint = bool(int(os.environ.get("GRADIENT_CHECKPOINT", "1")))
 
     # Late QAT
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
@@ -919,7 +927,8 @@ def main():
 
     # Build model
     _t0 = time.time()
-    model = HybridGDN(config, args.vocab_size)
+    model = HybridGDN(config, args.vocab_size,
+                      gradient_checkpoint=args.gradient_checkpoint)
     model = model.to(device).bfloat16()
     log0(f"Model built in {time.time()-_t0:.1f}s")
 
@@ -1047,20 +1056,33 @@ def main():
         log0(f"EMT: enabled (LAZY teacher init at step {emt_warmup_start_step}) "
              f"alpha_max={args.emt_alpha_max} "
              f"warmup={emt_warmup_start_step}->{emt_warmup_end_step} "
-             f"teacher_update_every={args.emt_teacher_update_every} T={args.emt_temperature}")
+             f"teacher_update_every={args.emt_teacher_update_every} T={args.emt_temperature} "
+             f"teacher_on_cpu={args.emt_teacher_on_cpu}")
     else:
         log0("EMT: disabled")
 
     def _init_teacher_from_ema() -> HybridGDN:
-        """Construct teacher model on GPU and load EMA state into it."""
-        tm = HybridGDN(config, args.vocab_size).to(device).bfloat16()
+        """Construct teacher model and load EMA state into it.
+
+        With EMT_TEACHER_ON_CPU=1 (default), teacher lives on CPU until each
+        forward pass. This eliminates the persistent ~2GB GPU footprint but
+        adds ~100ms per distillation step for host↔device transfer. Required
+        to avoid OOM on 8×H100 80GB when GDN + student activations already
+        saturate GPU memory.
+        """
+        # Build teacher on CPU first; move to GPU only if offload is disabled
+        tm = HybridGDN(config, args.vocab_size)
         with torch.no_grad():
             tgt_state = tm.state_dict()
-            typed = {k: v.to(dtype=tgt_state[k].dtype) for k, v in ema_state.items() if k in tgt_state}
+            typed = {k: v.to(dtype=tgt_state[k].dtype).cpu() for k, v in ema_state.items() if k in tgt_state}
             tm.load_state_dict(typed, strict=False)
         tm.eval()
         for p in tm.parameters():
             p.requires_grad = False
+        if not args.emt_teacher_on_cpu:
+            tm = tm.to(device).bfloat16()
+        else:
+            tm = tm.bfloat16()  # bf16 on CPU — keeps transfer cheap
         return tm
 
     def emt_alpha_for(step: int) -> float:
@@ -1169,13 +1191,15 @@ def main():
         if args.emt_enabled and cur_alpha > 0.0 and teacher_model is None:
             teacher_model = _init_teacher_from_ema()
             log0(f"EMT: teacher lazy-initialized at step {step} (alpha={cur_alpha:.3f})")
-        # Periodic teacher refresh from EMA
+        # Periodic teacher refresh from EMA (teacher lives on CPU when offloaded)
         if (teacher_model is not None
                 and step > 0
                 and step % args.emt_teacher_update_every == 0):
             with torch.no_grad():
                 tgt_state = teacher_model.state_dict()
-                typed = {k: v.to(dtype=tgt_state[k].dtype) for k, v in ema_state.items() if k in tgt_state}
+                _target_device = "cpu" if args.emt_teacher_on_cpu else device
+                typed = {k: v.to(dtype=tgt_state[k].dtype, device=_target_device)
+                         for k, v in ema_state.items() if k in tgt_state}
                 teacher_model.load_state_dict(typed, strict=False)
 
         # Gradient accumulation
@@ -1186,11 +1210,17 @@ def main():
         for micro_step in range(grad_accum_steps):
             x_micro = x[micro_step * micro_batch:(micro_step + 1) * micro_batch]
             y_micro = y[micro_step * micro_batch:(micro_step + 1) * micro_batch]
-            # EMT: compute teacher logits if active (no_grad, bf16)
+            # EMT: compute teacher logits if active. With CPU offload, move
+            # teacher to GPU just for this forward, then back to CPU.
             t_logits = None
             if teacher_model is not None and cur_alpha > 0.0:
+                if args.emt_teacher_on_cpu:
+                    teacher_model = teacher_model.to(device)
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     t_logits = teacher_model.forward_logits(x_micro)
+                if args.emt_teacher_on_cpu:
+                    teacher_model = teacher_model.to("cpu")
+                    torch.cuda.empty_cache()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = model(x_micro, y_micro,
                              teacher_logits=t_logits,
