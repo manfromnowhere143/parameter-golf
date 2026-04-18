@@ -232,19 +232,43 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 
 
 def build_sentencepiece_luts(sp, vocab_size, device):
-    base_bytes = torch.zeros(vocab_size, dtype=torch.float32, device=device)
-    has_space = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-    is_boundary = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-    for i in range(vocab_size):
-        piece = sp.id_to_piece(i)
-        raw = piece.encode("utf-8")
-        base_bytes[i] = len(raw)
+    """Canonical byte-counting LUT.
+
+    Fixed 2026-04-18 (Aweb Labs): the previous version inherited from PR #1711
+    double-counted the leading-space byte (LUT contained +1, eval then added +1
+    again via `has_leading_space & ~is_boundary_prev`). This deflated the
+    reported BPB by ~23%% and was the reason PR #1711 self-closed.
+
+    Canonical version matches PR #549 / PR #1019 exactly:
+      - base_bytes holds the UTF-8 byte length of the piece WITHOUT the
+        leading-space marker.
+      - has_leading_space flags pieces that start with U+2581; eval adds +1
+        conditional on previous token not being a boundary (BOS/EOS/UNK).
+      - is_boundary defaults TRUE; flipped to FALSE for valid tokens only.
+      - Byte-fallback tokens (single-byte pieces) are handled explicitly.
+    """
+    sp_vocab_size = int(sp.vocab_size())
+    table_size = max(sp_vocab_size, vocab_size)
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    for token_id in range(sp_vocab_size):
+        if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+            continue
+        is_boundary_token_np[token_id] = False
+        if sp.is_byte(token_id):
+            base_bytes_np[token_id] = 1
+            continue
+        piece = sp.id_to_piece(token_id)
         if piece.startswith("\u2581"):
-            has_space[i] = True
-            base_bytes[i] = len(piece[1:].encode("utf-8")) + 1
-        if sp.is_control(i) or sp.is_unknown(i):
-            is_boundary[i] = True
-    return base_bytes, has_space, is_boundary
+            has_leading_space_np[token_id] = True
+            piece = piece[1:]
+        base_bytes_np[token_id] = len(piece.encode("utf-8"))
+    return (
+        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    )
 
 
 def generate_coprime_shard_order(shard_files: list, seed: int = 42) -> list:
